@@ -3,7 +3,14 @@ package cmd
 import (
 	"github.com/kyma-project/cli/pkg/kyma/cmd/install"
 	"github.com/kyma-project/cli/pkg/kyma/cmd/provision/minikube"
+	"github.com/kyma-project/cli/pkg/kyma/cmd/test"
+	"github.com/kyma-project/cli/pkg/kyma/cmd/test/definitions"
+	del "github.com/kyma-project/cli/pkg/kyma/cmd/test/delete"
+	"github.com/kyma-project/cli/pkg/kyma/cmd/test/list"
+	"github.com/kyma-project/cli/pkg/kyma/cmd/test/run"
+	"github.com/kyma-project/cli/pkg/kyma/cmd/test/status"
 	"github.com/kyma-project/cli/pkg/kyma/cmd/uninstall"
+	"github.com/kyma-project/cli/pkg/kyma/cmd/version"
 
 	"github.com/kyma-project/cli/pkg/kyma/cmd/provision"
 	"github.com/kyma-project/cli/pkg/kyma/core"
@@ -30,22 +37,25 @@ Find more information at: https://github.com/kyma-project/cli
 	cmd.PersistentFlags().BoolVar(&o.NonInteractive, "non-interactive", false, "Do not use spinners")
 	cmd.PersistentFlags().StringVar(&o.KubeconfigPath, "kubeconfig", clientcmd.RecommendedHomeFile, "Path to kubeconfig")
 
-	versionCmd := NewVersionCmd(NewVersionOptions(o))
-	cmd.AddCommand(versionCmd)
-
-	completionCmd := NewCompletionCmd()
-	cmd.AddCommand(completionCmd)
-
 	provisionCmd := provision.NewCmd()
-	cmd.AddCommand(provisionCmd)
-	provisionMinikubeCmd := minikube.NewCmd(minikube.NewOptions(o))
-	provisionCmd.AddCommand(provisionMinikubeCmd)
+	provisionCmd.AddCommand(minikube.NewCmd(minikube.NewOptions(o)))
 
-	installCmd := install.NewCmd(install.NewOptions(o))
-	cmd.AddCommand(installCmd)
+	cmd.AddCommand(
+		version.NewCmd(version.NewOptions(o)),
+		NewCompletionCmd(),
+		install.NewCmd(install.NewOptions(o)),
+		uninstall.NewCmd(uninstall.NewOptions(o)),
+		provisionCmd,
+	)
 
-	uninstallCmd := uninstall.NewCmd(uninstall.NewOptions(o))
-	cmd.AddCommand(uninstallCmd)
+	testCmd := test.NewCmd()
+	testRunCmd := run.NewCmd(run.NewOptions(o))
+	testStatusCmd := status.NewCmd(status.NewOptions(o))
+	testDeleteCmd := del.NewCmd(del.NewOptions(o))
+	testListCmd := list.NewCmd(list.NewOptions(o))
+	testDefsCmd := definitions.NewCmd(definitions.NewOptions(o))
+	testCmd.AddCommand(testRunCmd, testStatusCmd, testDeleteCmd, testListCmd, testDefsCmd)
+	cmd.AddCommand(testCmd)
 
 	return cmd
 }

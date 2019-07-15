@@ -1,14 +1,11 @@
-package uninstall
+package version
 
-import (
-	"github.com/kyma-project/cli/pkg/kyma/core"
-	"time"
-)
+import "github.com/kyma-project/cli/pkg/kyma/core"
 
-//Options defines available options for the command
+//Options defines available options for the version command
 type Options struct {
 	*core.Options
-	Timeout time.Duration
+	Client bool
 }
 
 //NewOptions creates options with default values

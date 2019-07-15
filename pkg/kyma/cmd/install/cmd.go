@@ -12,6 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kyma-project/cli/pkg/kyma/cmd/version"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/kyma-project/cli/internal/kube"
+
+	"github.com/kyma-project/cli/internal/trust"
+
 	"github.com/kyma-project/cli/pkg/kyma/core"
 
 	docker "github.com/fsouza/go-dockerclient"
@@ -22,7 +31,6 @@ import (
 	"gopkg.in/src-d/go-git.v4/storage/memory"
 	yaml "gopkg.in/yaml.v2"
 
-	"github.com/kyma-project/cli/internal"
 	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/cobra"
 )
@@ -47,10 +55,9 @@ var (
 		"configmap/core-overrides": []string{
 			"test.acceptance.ui.minikubeIP",
 			"apiserver-proxy.minikubeIP",
-			"configurations-generator.minikubeIP",
+			"iam-kubeconfig-service.minikubeIP",
 			"console-backend-service.minikubeIP",
 			"test.acceptance.cbs.minikubeIP",
-			"test.acceptance.ui.logging.enabled",
 		},
 		"configmap/assetstore-overrides": []string{
 			"asset-store-controller-manager.minikubeIP",
@@ -70,14 +77,9 @@ func NewCmd(o *Options) *cobra.Command {
 	cobraCmd := &cobra.Command{
 		Use:   "install",
 		Short: "Installs Kyma on a running Kubernetes cluster",
-		Long: `Install Kyma on a running Kubernetes cluster.
+		Long: `Installs Kyma on a running Kubernetes cluster. For more information on the command, see https://github.com/kyma-project/cli/tree/master/pkg/kyma/docs/install.md.
 
-Make sure that your KUBECONFIG is already pointing to the target cluster.
-The command:
-- Installs Tiller
-- Deploys the Kyma Installer
-- Configures the Kyma Installer using the latest minimal configuration
-- Triggers Kyma installation
+
 `,
 		RunE:    func(_ *cobra.Command, _ []string) error { return cmd.Run() },
 		Aliases: []string{"i"},
@@ -91,7 +93,7 @@ The command:
 	cobraCmd.Flags().StringVarP(&o.LocalSrcPath, "src-path", "", "", "Path to local sources")
 	cobraCmd.Flags().StringVarP(&o.LocalInstallerVersion, "installer-version", "", "", "Version of the Kyma Installer Docker image used for local installation")
 	cobraCmd.Flags().StringVarP(&o.LocalInstallerDir, "installer-dir", "", "", "The directory of the Kyma Installer Docker image used for local installation")
-	cobraCmd.Flags().DurationVarP(&o.Timeout, "timeout", "", 0, "Timeout after which CLI stops watching the installation progress")
+	cobraCmd.Flags().DurationVarP(&o.Timeout, "timeout", "", 30*time.Minute, "Timeout after which CLI stops watching the installation progress")
 	cobraCmd.Flags().StringVarP(&o.Password, "password", "p", "", "Predefined cluster password")
 	cobraCmd.Flags().VarP(&o.OverrideConfigs, "override", "o", "Path to YAML file with parameters to override. Multiple entries of this flag are allowed")
 
@@ -100,80 +102,63 @@ The command:
 
 //Run runs the command
 func (cmd *command) Run() error {
-	err := cmd.validateFlags()
-	if err != nil {
+	var err error
+	if cmd.K8s, err = kube.NewFromConfig("", cmd.KubeconfigPath); err != nil {
+		return errors.Wrap(err, "Could not initialize the Kubernetes client. Please make sure that you have a valid kubeconfig.")
+	}
+
+	if err := cmd.validateFlags(); err != nil {
 		return err
 	}
 
-	s := cmd.NewStep("Checking requirements")
-	err = cmd.checkInstallRequirements()
-	if err != nil {
-		s.Failure()
-		return err
-	}
-	s.Successf("Requirements verified")
-
+	s := cmd.NewStep("Checking installation source")
 	if cmd.opts.Local {
 		s.LogInfof("Installing Kyma from local path: '%s'", cmd.opts.LocalSrcPath)
 	} else {
 		s.LogInfof("Installing Kyma in version '%s'", cmd.opts.ReleaseVersion)
 	}
+	s.Successf("Installation source checked")
 
 	s = cmd.NewStep("Installing Tiller")
-	err = cmd.installTiller()
-	if err != nil {
+	if err := cmd.installTiller(); err != nil {
 		s.Failure()
 		return err
 	}
-	s.Successf("Tiller installed")
+	s.Successf("Tiller deployed")
 
 	s = cmd.NewStep("Deploying Kyma Installer")
-	err = cmd.installInstaller()
-	if err != nil {
+	if err := cmd.installInstaller(); err != nil {
 		s.Failure()
 		return err
 	}
 	s.Successf("Kyma Installer deployed")
 
 	s = cmd.NewStep("Configuring Helm")
-	err = cmd.configureHelm()
-	if err != nil {
+	if err := cmd.configureHelm(); err != nil {
 		s.Failure()
 		return err
 	}
 	s.Successf("Helm configured")
 
 	s = cmd.NewStep("Requesting Kyma Installer to install Kyma")
-	err = cmd.activateInstaller()
-	if err != nil {
+	if err := cmd.activateInstaller(); err != nil {
 		s.Failure()
 		return err
 	}
 	s.Successf("Kyma Installer is installing Kyma")
 
 	if !cmd.opts.NoWait {
-		err = cmd.waitForInstaller()
-		if err != nil {
+		if err := cmd.waitForInstaller(); err != nil {
 			return err
 		}
 	}
-
-	err = cmd.printSummary()
-	if err != nil {
-		return err
+	if err := cmd.importCertificate(trust.NewCertifier(cmd.K8s)); err != nil {
+		// certificate import errors do not mean installation failed
+		cmd.CurrentStep.LogError(err.Error())
 	}
 
-	return nil
-}
-
-func (cmd *command) checkInstallRequirements() error {
-	versionWarning, err := cmd.Kubectl().CheckVersion()
-	if err != nil {
-		cmd.CurrentStep.Failure()
+	if err := cmd.printSummary(); err != nil {
 		return err
-	}
-	if versionWarning != "" {
-		cmd.CurrentStep.LogError(versionWarning)
 	}
 	return nil
 }
@@ -213,22 +198,18 @@ func (cmd *command) validateFlags() error {
 }
 
 func (cmd *command) installTiller() error {
-	check, err := cmd.Kubectl().IsPodDeployed("kube-system", "name", "tiller")
+	deployed, err := cmd.K8s.IsPodDeployedByLabel("kube-system", "name", "tiller")
 	if err != nil {
 		return err
+
 	}
-	if !check {
+	if !deployed {
 		_, err = cmd.Kubectl().RunCmd("apply", "-f", cmd.releaseSrcFile("/installation/resources/tiller.yaml"))
 		if err != nil {
 			return err
 		}
 	}
-	err = cmd.Kubectl().WaitForPodReady("kube-system", "name", "tiller")
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return cmd.K8s.WaitPodStatusByLabel("kube-system", "name", "tiller", corev1.PodRunning)
 }
 
 func (cmd *command) configureHelm() error {
@@ -242,51 +223,22 @@ func (cmd *command) configureHelm() error {
 		return nil
 	}
 
-	secret, err := cmd.Kubectl().RunCmd("-n", "kyma-installer", "--ignore-not-found=false", "get", "secret", "helm-secret", "-o", "yaml")
+	secret, err := cmd.K8s.Static().CoreV1().Secrets("kyma-installer").Get("helm-secret", metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
 
-	cfg := make(map[interface{}]interface{})
-	err = yaml.Unmarshal([]byte(secret), &cfg)
+	err = ioutil.WriteFile(filepath.Join(helmHome, "ca.pem"), secret.Data["global.helm.ca.crt"], 0644)
 	if err != nil {
 		return err
 	}
 
-	data, ok := cfg["data"].(map[interface{}]interface{})
-	if !ok {
-		return fmt.Errorf("Unable to get data from the Helm Secret")
-	}
-
-	err = writeHelmFile(data, "global.helm.ca.crt", helmHome, "ca.pem")
+	err = ioutil.WriteFile(filepath.Join(helmHome, "cert.pem"), secret.Data["global.helm.tls.crt"], 0644)
 	if err != nil {
 		return err
 	}
 
-	err = writeHelmFile(data, "global.helm.tls.crt", helmHome, "cert.pem")
-	if err != nil {
-		return err
-	}
-
-	err = writeHelmFile(data, "global.helm.tls.key", helmHome, "key.pem")
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func writeHelmFile(data map[interface{}]interface{}, helmData string, helmHome string, filename string) error {
-	value, ok := data[helmData].(string)
-	if !ok {
-		return fmt.Errorf("Unable to get %s from Helm Secret data", helmData)
-	}
-	valueDecoded, err := base64.StdEncoding.DecodeString(value)
-	if err != nil {
-		return err
-	}
-
-	err = ioutil.WriteFile(filepath.Join(helmHome, filename), valueDecoded, 0644)
+	err = ioutil.WriteFile(filepath.Join(helmHome, "key.pem"), secret.Data["global.helm.tls.key"], 0644)
 	if err != nil {
 		return err
 	}
@@ -294,11 +246,12 @@ func writeHelmFile(data map[interface{}]interface{}, helmData string, helmHome s
 }
 
 func (cmd *command) installInstaller() error {
-	check, err := cmd.Kubectl().IsPodDeployed("kyma-installer", "name", "kyma-installer")
+	deployed, err := cmd.K8s.IsPodDeployedByLabel("kyma-installer", "name", "kyma-installer")
 	if err != nil {
 		return err
 	}
-	if !check {
+
+	if !deployed {
 		if cmd.opts.Local {
 			err = cmd.installInstallerFromLocalSources()
 		} else {
@@ -307,14 +260,8 @@ func (cmd *command) installInstaller() error {
 		if err != nil {
 			return err
 		}
-
 	}
-	err = cmd.Kubectl().WaitForPodReady("kyma-installer", "name", "kyma-installer")
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return cmd.K8s.WaitPodStatusByLabel("kyma-installer", "name", "kyma-installer", corev1.PodRunning)
 }
 
 func (cmd *command) downloadFile(path string) (io.ReadCloser, error) {
@@ -709,6 +656,19 @@ func (cmd *command) applyOverrideFiles() error {
 				return fmt.Errorf("Unable to get name from config. File: %s", file)
 			}
 
+			if err := cmd.checkIfResourcePresent(namespace, kind, name); err != nil {
+				if strings.Contains(err.Error(), "not found") {
+					if err := cmd.applyResourceFile(file); err != nil {
+						return fmt.Errorf(
+							"Unable to apply file %s. Error: %s", file, err.Error())
+
+					}
+					continue
+				} else {
+					return fmt.Errorf("Unable to check if resource is installed. Error: %s", err.Error())
+				}
+			}
+
 			_, err := cmd.Kubectl().RunCmd("-n",
 				strings.ToLower(namespace),
 				"patch",
@@ -727,6 +687,16 @@ func (cmd *command) applyOverrideFiles() error {
 	return nil
 }
 
+func (cmd *command) checkIfResourcePresent(namespace, kind, name string) error {
+	_, err := cmd.Kubectl().RunCmd("-n", namespace, "get", kind, name)
+	return err
+}
+
+func (cmd *command) applyResourceFile(filepath string) error {
+	_, err := cmd.Kubectl().RunCmd("apply", "-f", filepath)
+	return err
+}
+
 func (cmd *command) setAdminPassword() error {
 	if cmd.opts.Password == "" {
 		return nil
@@ -738,27 +708,12 @@ func (cmd *command) setAdminPassword() error {
 }
 
 func (cmd *command) printSummary() error {
-	version, err := internal.GetKymaVersion(cmd.opts.Verbose)
+	v, err := version.KymaVersion(cmd.opts.Verbose, cmd.K8s)
 	if err != nil {
 		return err
 	}
 
-	pwdEncoded, err := cmd.Kubectl().RunCmd("-n", "kyma-system", "get", "secret", "admin-user", "-o", "jsonpath='{.data.password}'")
-	if err != nil {
-		return err
-	}
-
-	pwdDecoded, err := base64.StdEncoding.DecodeString(pwdEncoded)
-	if err != nil {
-		return err
-	}
-
-	emailEncoded, err := cmd.Kubectl().RunCmd("-n", "kyma-system", "get", "secret", "admin-user", "-o", "jsonpath='{.data.email}'")
-	if err != nil {
-		return err
-	}
-
-	emailDecoded, err := base64.StdEncoding.DecodeString(emailEncoded)
+	adm, err := cmd.K8s.Static().CoreV1().Secrets("kyma-system").Get("admin-user", metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -771,11 +726,11 @@ func (cmd *command) printSummary() error {
 	fmt.Println()
 	fmt.Println(clusterInfo)
 	fmt.Println()
-	fmt.Printf("Kyma is installed in version %s\n", version)
-	fmt.Printf("Kyma console:     https://console.%s\n", cmd.opts.Domain)
-	fmt.Printf("Kyma admin email: %s\n", emailDecoded)
+	fmt.Printf("Kyma is installed in version %s\n", v)
+	fmt.Printf("Kyma console:\t\thttps://console.%s\n", cmd.opts.Domain)
+	fmt.Printf("Kyma admin email:\t%s\n", adm.Data["email"])
 	if cmd.opts.Password == "" || cmd.opts.NonInteractive {
-		fmt.Printf("Kyma admin password:   %s\n", pwdDecoded)
+		fmt.Printf("Kyma admin password:\t%s\n", adm.Data["password"])
 	}
 	fmt.Println()
 	fmt.Println("Happy Kyma-ing! :)")
@@ -822,8 +777,9 @@ func (cmd *command) waitForInstaller() error {
 			case "Error":
 				if !errorOccured {
 					errorOccured = true
-					cmd.CurrentStep.Failuref("Kyma installation failed: %s", desc)
-					cmd.CurrentStep.LogInfof("To fetch the logs from the installer, run: 'kubectl logs -n kyma-installer -l name=kyma-installer'")
+					cmd.CurrentStep.LogErrorf("%s failed, which may be OK. Will retry later...", desc)
+					cmd.CurrentStep.LogInfo("To fetch the error logs from the installer, run: kubectl get installation  kyma-installation -o go-template --template='{{- range .status.errorLog }}{{printf \"%s:\\n %s\\n\" .component .log}}{{- end}}'")
+					cmd.CurrentStep.LogInfo("To fetch the application logs from the installer, run: kubectl logs -n kyma-installer -l name=kyma-installer")
 				}
 
 			case "InProgress":
@@ -855,12 +811,7 @@ func (cmd *command) getInstallationStatus() (status string, desc string, err err
 }
 
 func (cmd *command) printInstallationErrorLog() error {
-	logs, err := cmd.Kubectl().RunCmd("get", "installation", "kyma-installation", "-o", "go-template", `--template={{- range .status.errorLog -}}
-{{.component}}:
-{{.log}} [{{.occurrences}}]
-
-{{- end}}
-`)
+	logs, err := cmd.Kubectl().RunCmd("get", "installation", "kyma-installation", "-o", "go-template", "--template={{- range .status.errorLog -}}{{printf \"%s:\n %s [%s]\n\" .component .log .occurrences}}{{- end}}")
 	if err != nil {
 		return err
 	}
@@ -879,13 +830,24 @@ func (cmd *command) releaseFile(path string) string {
 func (cmd *command) patchMinikubeIP() error {
 	minikubeIP, err := minikube.RunCmd(cmd.opts.Verbose, "ip")
 	if err != nil {
-		return err
+		cmd.CurrentStep.LogInfo("unable to perform 'minikube ip' command. Patches won't be applied")
+		return nil
 	}
 	minikubeIP = strings.TrimSpace(minikubeIP)
 
 	for k, v := range patchMap {
 		for _, pData := range v {
-			_, err := cmd.Kubectl().RunCmd("-n", "kyma-installer", "patch", k, "--type=json",
+			if _, err := cmd.Kubectl().RunCmd("-n", "kyma-installer", "get", k); err != nil {
+				if strings.Contains(err.Error(), "not found") {
+					cmd.CurrentStep.LogInfof("resource '%s' not found, won't be patched", k)
+					continue
+				} else {
+					return err
+				}
+			}
+
+			_, err = cmd.Kubectl().RunCmd("-n", "kyma-installer", "patch", k, "--type=json",
+				"--allow-missing-template-keys=true",
 				fmt.Sprintf("--patch=[{'op': 'replace', 'path': '/data/%s', 'value': '%s'}]", pData, minikubeIP))
 			if err != nil {
 				return err
@@ -893,5 +855,37 @@ func (cmd *command) patchMinikubeIP() error {
 		}
 	}
 
+	return nil
+}
+
+func (cmd *command) importCertificate(ca trust.Certifier) error {
+	if !cmd.opts.NoWait {
+		// get cert from cluster
+		cert, err := ca.Certificate()
+		if err != nil {
+			return err
+		}
+
+		tmpFile, err := ioutil.TempFile(os.TempDir(), "kyma-*.crt")
+		if err != nil {
+			return errors.Wrap(err, "Cannot create temporary file for Kyma certificate")
+		}
+		defer os.Remove(tmpFile.Name())
+
+		if _, err = tmpFile.Write(cert); err != nil {
+			return errors.Wrap(err, "Failed to write the kyma certificate")
+		}
+		if err := tmpFile.Close(); err != nil {
+			return err
+		}
+
+		if err := ca.StoreCertificate(tmpFile.Name(), cmd.CurrentStep); err != nil {
+			return err
+		}
+		cmd.CurrentStep.Successf("Kyma root certificate imported")
+
+	} else {
+		cmd.CurrentStep.LogError(ca.Instructions())
+	}
 	return nil
 }

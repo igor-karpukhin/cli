@@ -7,6 +7,9 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/kyma-project/cli/internal/kube"
 	"github.com/kyma-project/cli/pkg/kyma/core"
 	"github.com/pkg/errors"
 
@@ -19,9 +22,8 @@ var (
 )
 
 const (
-	sleep                  = 10 * time.Second
-	timeoutSimpleDeletion  = "5s"
-	timeoutComplexDeletion = "30s"
+	sleep           = 10 * time.Second
+	deletionTimeout = "120s"
 )
 
 type command struct {
@@ -52,26 +54,20 @@ This command:
 		Aliases: []string{"i"},
 	}
 
-	cobraCmd.Flags().DurationVarP(&o.Timeout, "timeout", "", 0, "Timeout after which Kyma CLI stops watching the installation progress")
+	cobraCmd.Flags().DurationVarP(&o.Timeout, "timeout", "", 30*time.Minute, "Timeout after which Kyma CLI stops watching the uninstallation progress")
 
 	return cobraCmd
 }
 
 //Run runs the command
 func (cmd *command) Run() error {
-	s := cmd.NewStep("Checking requirements")
-	err := cmd.checkUninstallRequirements()
-	if err != nil {
-		s.Failure()
-		return err
+	var err error
+	if cmd.K8s, err = kube.NewFromConfig("", cmd.KubeconfigPath); err != nil {
+		return errors.Wrap(err, "Could not initialize the Kubernetes client. PLease make sure that you have a valid kubeconfig.")
 	}
-	s.Successf("Requirements verified")
 
-	s.LogInfof("Uninstalling Kyma")
-
-	s = cmd.NewStep("Requesting kyma-installer to uninstall Kyma")
-	err = cmd.activateInstallerForUninstall()
-	if err != nil {
+	s := cmd.NewStep("Uninstalling Kyma")
+	if err := cmd.activateInstallerForUninstall(); err != nil {
 		s.Failure()
 		return err
 	}
@@ -98,13 +94,14 @@ func (cmd *command) Run() error {
 	}
 	s.Successf("Tiller deleted")
 
-	s = cmd.NewStep("Deleting ClusterRoleBinding for admin")
-	err = cmd.deleteClusterRoleBinding()
+	s = cmd.NewStep("Deleting CRDs")
+	// see https://github.com/kyma-project/kyma/issues/1826
+	err = cmd.deleteLeftoverResources("crd", crdGroupsToDelete)
 	if err != nil {
 		s.Failure()
 		return err
 	}
-	s.Successf("ClusterRoleBinding for admin deleted")
+	s.Successf("CRDs deleted")
 
 	s = cmd.NewStep("Deleting Namespaces")
 	// see https://github.com/kyma-project/kyma/issues/1826
@@ -115,15 +112,6 @@ func (cmd *command) Run() error {
 	}
 	s.Successf("Namespaces deleted")
 
-	s = cmd.NewStep("Deleting CRDs")
-	// see https://github.com/kyma-project/kyma/issues/1826
-	err = cmd.deleteLeftoverResources("crd", crdGroupsToDelete)
-	if err != nil {
-		s.Failure()
-		return err
-	}
-	s.Successf("CRDs deleted")
-
 	err = cmd.printUninstallSummary()
 	if err != nil {
 		return err
@@ -132,69 +120,54 @@ func (cmd *command) Run() error {
 	return nil
 }
 
-func (cmd *command) checkUninstallRequirements() error {
-	versionWarning, err := cmd.Kubectl().CheckVersion()
-	if err != nil {
-		cmd.CurrentStep.Failure()
-		return err
-	}
-	if versionWarning != "" {
-		cmd.CurrentStep.LogError(versionWarning)
-	}
-	return nil
-}
-
 func (cmd *command) activateInstallerForUninstall() error {
-	check, err := cmd.Kubectl().IsPodDeployed("kyma-installer", "name", "kyma-installer")
+	deployed, err := cmd.K8s.IsPodDeployedByLabel("kyma-installer", "name", "kyma-installer")
 	if err != nil {
 		return err
 	}
-	if !check {
+
+	if !deployed {
 		return nil
 	}
 
 	_, err = cmd.Kubectl().RunCmd("label", "installation/kyma-installation", "action=uninstall")
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (cmd *command) deleteInstaller() error {
-	_, err := cmd.Kubectl().RunCmd("delete", "CustomResourceDefinition", "installations.installer.kyma-project.io", "--timeout="+timeoutComplexDeletion, "--ignore-not-found=true")
+	_, err := cmd.Kubectl().RunCmd("delete", "CustomResourceDefinition", "installations.installer.kyma-project.io", "--timeout="+deletionTimeout, "--ignore-not-found=true")
 	if err != nil {
 		return err
 	}
 
-	_, err = cmd.Kubectl().RunCmd("delete", "CustomResourceDefinition", "releases.release.kyma-project.io", "--timeout="+timeoutComplexDeletion, "--ignore-not-found=true")
+	_, err = cmd.Kubectl().RunCmd("delete", "CustomResourceDefinition", "releases.release.kyma-project.io", "--timeout="+deletionTimeout, "--ignore-not-found=true")
 	if err != nil {
 		return err
 	}
 
-	_, err = cmd.Kubectl().RunCmd("delete", "namespace", "kyma-installer", "--timeout="+timeoutComplexDeletion, "--ignore-not-found=true")
-	if err != nil {
+	err = cmd.K8s.Static().CoreV1().Namespaces().Delete("kyma-installer", &metav1.DeleteOptions{})
+	if err != nil && !strings.Contains(err.Error(), "not found") { // treat not found as positive deletion
 		return err
 	}
 
 	for {
-		check, err := cmd.Kubectl().IsClusterResourceDeployed("namespace", "kyma-project.io/installation", "")
+		ns, err := cmd.K8s.Static().CoreV1().Namespaces().List(metav1.ListOptions{LabelSelector: "kyma-project.io/installation="})
 		if err != nil {
 			return err
 		}
-		if !check {
+		if len(ns.Items) == 0 {
 			break
 		}
 		time.Sleep(sleep)
 	}
 
-	_, err = cmd.Kubectl().RunCmd("delete", "ClusterRoleBinding", "kyma-installer", "--timeout="+timeoutSimpleDeletion, "--ignore-not-found=true")
-	if err != nil {
+	err = cmd.K8s.Static().RbacV1().ClusterRoleBindings().Delete("kyma-installer", &metav1.DeleteOptions{})
+	if err != nil && !strings.Contains(err.Error(), "not found") {
 		return err
 	}
 
-	_, err = cmd.Kubectl().RunCmd("delete", "ClusterRole", "kyma-installer-reader", "--timeout="+timeoutSimpleDeletion, "--ignore-not-found=true")
-	if err != nil {
+	err = cmd.K8s.Static().RbacV1().ClusterRoles().Delete("kyma-installer-reader", &metav1.DeleteOptions{})
+	if err != nil && !strings.Contains(err.Error(), "not found") { // treat not found as positive deletion
 		return err
 	}
 
@@ -203,34 +176,31 @@ func (cmd *command) deleteInstaller() error {
 
 //cannot use the original yaml file as the version is not known or might be even custom
 func (cmd *command) deleteTiller() error {
-	_, err := cmd.Kubectl().RunCmd("-n", "kube-system", "delete", "all", "-l", "name=tiller")
+	_, err := cmd.Kubectl().RunCmd("-n", "kube-system", "delete", "deployment,ServiceAccount,ClusterRoleBinding,Service,Job", "-l", "kyma-project.io/installation=")
 	if err != nil {
 		return err
 	}
 
-	err = cmd.Kubectl().WaitForPodGone("kube-system", "name", "tiller")
+	err = cmd.K8s.Static().RbacV1().RoleBindings("kube-system").Delete("tiller-certs", &metav1.DeleteOptions{})
+	if err != nil && !strings.Contains(err.Error(), "not found") {
+		return err
+	}
+
+	err = cmd.K8s.Static().RbacV1().Roles("kube-system").Delete("tiller-certs-installer", &metav1.DeleteOptions{})
+	if err != nil && !strings.Contains(err.Error(), "not found") {
+		return err
+	}
+
+	err = cmd.K8s.Static().CoreV1().ServiceAccounts("kube-system").Delete("tiller-certs-sa", &metav1.DeleteOptions{})
+	if err != nil && !strings.Contains(err.Error(), "not found") {
+		return err
+	}
+
+	err = cmd.K8s.WaitPodsGone("kube-system", "name", "tiller")
 	if err != nil {
 		return err
 	}
 
-	_, err = cmd.Kubectl().RunCmd("delete", "ClusterRoleBinding", "tiller-cluster-admin", "--timeout="+timeoutSimpleDeletion, "--ignore-not-found=true")
-	if err != nil {
-		return nil
-	}
-
-	_, err = cmd.Kubectl().RunCmd("-n", "kube-system", "delete", "ServiceAccount", "tiller", "--timeout="+timeoutSimpleDeletion, "--ignore-not-found=true")
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (cmd *command) deleteClusterRoleBinding() error {
-	_, err := cmd.Kubectl().RunCmd("delete", "clusterrolebinding", "cluster-admin-binding", "--timeout="+timeoutSimpleDeletion, "--ignore-not-found=true")
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -250,7 +220,7 @@ func (cmd *command) deleteLeftoverResources(resourceType string, resources []str
 		for _, v := range resources {
 			if strings.HasSuffix(item, v) {
 				cmd.CurrentStep.Status(item)
-				_, err := cmd.Kubectl().RunCmd("delete", resourceType, item, "--timeout="+timeoutComplexDeletion)
+				_, err := cmd.Kubectl().RunCmd("delete", resourceType, item, "--timeout="+deletionTimeout)
 				if err != nil {
 					return err
 				}
@@ -305,8 +275,8 @@ func (cmd *command) waitForInstallerToUninstall() error {
 			case "Error":
 				if !errorOccured {
 					errorOccured = true
-					cmd.CurrentStep.Failuref("Failed to uninstall Kyma: %s", desc)
-					cmd.CurrentStep.LogInfof("To fetch the logs from the Installer, run: 'kubectl logs -n kyma-installer -l name=kyma-installer'")
+					cmd.CurrentStep.LogInfof("There was an error uninstalling Kyma, which might be OK. Will retry later...\n%s", desc)
+					cmd.CurrentStep.LogInfof("For more information, run: 'kubectl logs -n kyma-installer -l name=kyma-installer'")
 				}
 
 			case "InProgress":
