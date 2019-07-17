@@ -1,10 +1,16 @@
 required = [
   "github.com/golang/lint/golint",
+  "github.com/russross/blackfriday"
 ]
+
 
 [prune]
   go-tests = true
   unused-packages = true
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/russross/blackfriday"
 
 [[constraint]]
   name = "github.com/briandowns/spinner"

@@ -15,6 +15,7 @@ import (
 	"github.com/kyma-project/cli/pkg/kyma/cmd/provision"
 	"github.com/kyma-project/cli/pkg/kyma/core"
 	"github.com/spf13/cobra"
+	"github.com/spf13/cobra/doc"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -56,6 +57,11 @@ Find more information at: https://github.com/kyma-project/cli
 	testDefsCmd := definitions.NewCmd(definitions.NewOptions(o))
 	testCmd.AddCommand(testRunCmd, testStatusCmd, testDeleteCmd, testListCmd, testDefsCmd)
 	cmd.AddCommand(testCmd)
+
+	err := doc.GenMarkdownTree(cmd, "./pkg/kyma/docs")
+	if err != nil {
+		panic(err)
+	}
 
 	return cmd
 }
